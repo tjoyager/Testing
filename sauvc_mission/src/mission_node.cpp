@@ -1,9 +1,9 @@
 /**
- * SAUVC 2026 MISSION CONTROLLER - "SMOOTH OPERATOR" EDITION
- * Karakteristik:
- * - Simultaneous Yaw & Surge (Belok sambil jalan)
- * - Aggressive P-Gain untuk alignment cepat
- * - Blind Pass Timer untuk menembus gate dengan percaya diri
+ * SAUVC 2026 NAVIGATION TASK - "HYBRID COMPATIBLE"
+ * Kompatibel dengan: sauvc_vision (Hybrid Edition)
+ * Logika: 
+ * - Input Vision X = 0 (Tengah), -X (Kiri), +X (Kanan)
+ * - PID Controller menyesuaikan error menuju 0.
  */
 
 #include <rclcpp/rclcpp.hpp>
@@ -17,11 +17,9 @@ enum MissionState {
     WAIT_FOR_SENSORS,
     DIVE_TO_DEPTH,
     SEARCH_GATE,
-    ALIGN_GATE,         // Visual Servoing (Mulus)
-    PASS_THROUGH_GATE,  // Blind Pass (Gas Pol)
-    SEARCH_FLARE,
-    ALIGN_BUMP_FLARE,
-    SURFACE
+    ALIGN_GATE,
+    PASS_THROUGH_GATE,
+    SURFACE_END
 };
 
 class MissionNode : public rclcpp::Node {
@@ -35,15 +33,14 @@ public:
         sub_odom_ = this->create_subscription<nav_msgs::msg::Odometry>(
             "/odom", 10, std::bind(&MissionNode::odom_cb, this, _1));
 
-        // Timer 20Hz (50ms) -> Cukup responsif untuk kontrol halus
         timer_ = this->create_wall_timer(
             std::chrono::milliseconds(50), std::bind(&MissionNode::control_loop, this));
         
         state_ = WAIT_FOR_SENSORS;
-        target_depth_ = -1.0; // Sesuaikan dengan kedalaman gate di video (~1 meter)
+        target_depth_ = -1.0; 
         current_depth_ = 0.0;
         
-        RCLCPP_INFO(this->get_logger(), "Mission Start: Waiting for Odom...");
+        RCLCPP_INFO(this->get_logger(), "Navigation Mission Started (Hybrid Logic).");
     }
 
 private:
@@ -76,7 +73,6 @@ private:
                         state_ = SEARCH_GATE;
                         RCLCPP_INFO(this->get_logger(), "Depth Reached! Searching Gate...");
                     } else {
-                        // Turun cepat tapi terkontrol
                         cmd.linear.z = std::clamp(error * 1.5, -0.5, 0.5); 
                     }
                 }
@@ -88,88 +84,62 @@ private:
                     state_ = ALIGN_GATE;
                     RCLCPP_INFO(this->get_logger(), "Gate Found! Aligning...");
                 } else {
-                    cmd.angular.z = 0.2; // Putar pelan cari target
+                    cmd.angular.z = 0.2; // Putar pelan (Scanning)
                     maintain_depth(cmd);
                 }
                 break;
 
-            // --- INI BAGIAN KUNCI GERAKAN MULUS ---
             case ALIGN_GATE:
                 if (vision_active && has_detection("GATE")) {
                     auto gate = get_detection("GATE");
                     
-                    // Error Posisi (Pixel)
-                    double err_yaw = (320 - gate.x); // 320 = Center Image
+                    // --- LOGIKA BARU (Hybrid) ---
+                    // Karena Vision mengirim 0 sebagai titik tengah:
+                    // Jika gate.x positif (Kanan), Robot harus putar Kanan (negatif z?) -> Cek koordinat ROS (ENU)
+                    // Standar ROS: Yaw Positif = Putar Kiri (CCW).
+                    // Jika objek ada di KANAN (x > 0), kita mau putar KANAN (Yaw Negatif).
+                    // Maka rumusnya: -Kp * error
                     
-                    // TUNING PARAMETER:
-                    // 0.004 = Cukup agresif untuk koreksi arah (lihat video detik 0:02-0:04)
-                    cmd.angular.z = err_yaw * 0.004; 
+                    double error_yaw = gate.x; // Jarak dari tengah (0)
                     
-                    // Maju konstan biar gerakan mengalir (Curve Motion)
-                    cmd.linear.x = 0.4; 
+                    // Tuning PID (P-Control)
+                    // 0.003 adalah gain. Semakin besar = semakin agresif (awas overshoot)
+                    cmd.angular.z = -error_yaw * 0.003; 
+                    
+                    // Maju pelan sambil koreksi (Curve motion)
+                    cmd.linear.x = 0.3;
 
-                    // Logika Tembus:
-                    // Jika Area Gate > 45.000 (Sangat besar/dekat), langsung tembus!
+                    // Logika Tembus (Jika Area sudah besar)
                     if (gate.distance > 45000) { 
                         state_ = PASS_THROUGH_GATE;
                         pass_through_timer_ = this->now();
-                        RCLCPP_INFO(this->get_logger(), "GATE LOCK! BLIND PASS START!");
+                        RCLCPP_INFO(this->get_logger(), "GATE LOCKED! FULL SPEED!");
                     }
                 } else {
-                    state_ = SEARCH_GATE; // Hilang target, cari lagi
+                    // Jika hilang sebentar, diam dulu (tunggu Vision Counter pulih)
+                    // atau kembali SEARCH jika lama hilang
+                    cmd.linear.x = 0.0;
+                    // state_ = SEARCH_GATE; 
                 }
                 maintain_depth(cmd);
                 break;
 
-            // --- INI AGAR TIDAK RAGU SAAT LEWAT ---
             case PASS_THROUGH_GATE:
-                // Gas Lurus tanpa belok (Blind)
-                cmd.linear.x = 0.6; // Lebih cepat sedikit
-                cmd.angular.z = 0.0; // Kunci arah lurus
+                // Blind pass (Maju buta lurus)
+                cmd.linear.x = 0.6; 
+                cmd.angular.z = 0.0; 
                 maintain_depth(cmd);
                 
-                // Maju buta selama 5 detik (pastikan seluruh badan lewat)
+                // Maju selama 5 detik
                 if ((this->now() - pass_through_timer_).seconds() > 5.0) {
-                    state_ = SEARCH_FLARE;
-                    RCLCPP_INFO(this->get_logger(), "Gate Passed. Searching Flare...");
+                    state_ = SURFACE_END; // Atau lanjut ke task Drum
+                    RCLCPP_INFO(this->get_logger(), "Gate Passed. Mission Complete.");
                 }
                 break;
 
-            case SEARCH_FLARE:
-                // Cari Flare (Prioritas Target, abaikan Obstacle dulu kalau mau simpel)
-                if (vision_active && has_detection("FLARE")) {
-                    state_ = ALIGN_BUMP_FLARE;
-                    RCLCPP_INFO(this->get_logger(), "Flare Found! Attacking...");
-                } else {
-                    cmd.linear.x = 0.2; // Maju pelan
-                    cmd.angular.z = 0.2; // Sambil scanning
-                    maintain_depth(cmd);
-                }
-                break;
-            
-            case ALIGN_BUMP_FLARE:
-                 if (vision_active && has_detection("FLARE")) {
-                    auto flare = get_detection("FLARE");
-                    double err_x = (320 - flare.x);
-
-                    // Alignment Flare juga harus agresif
-                    cmd.angular.z = err_x * 0.005; // Lebih tajam karena flare kecil
-                    cmd.linear.x = 0.3; // Dekati perlahan
-
-                    if (flare.distance > 20000) { // Jika sudah dekat sekali
-                         RCLCPP_INFO(this->get_logger(), "BUMP!");
-                         // Stop atau lanjut tugas berikutnya
-                         state_ = SURFACE;
-                    }
-                 } else {
-                     state_ = SEARCH_FLARE;
-                 }
-                 maintain_depth(cmd);
-                 break;
-
-            case SURFACE:
+            case SURFACE_END:
                 cmd.linear.x = 0.0;
-                cmd.linear.z = 0.5; // Naik ke permukaan
+                cmd.linear.z = 0.5;
                 break;
         }
 
@@ -178,7 +148,6 @@ private:
 
     void maintain_depth(geometry_msgs::msg::Twist &cmd) {
         double error = target_depth_ - current_depth_;
-        // P-Control simpel untuk jaga kedalaman
         if (std::abs(error) > 0.05) {
             cmd.linear.z = error * 1.0;
         }
