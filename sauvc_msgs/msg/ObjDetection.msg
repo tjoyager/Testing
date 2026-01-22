@@ -1,9 +1,0 @@
-string label
-string color
-string detection_type
-int32 x
-int32 y
-int32 width
-int32 height
-float32 distance
-float32 confidence
