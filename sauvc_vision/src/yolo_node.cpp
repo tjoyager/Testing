@@ -1,8 +1,9 @@
 /**
- * SAUVC 2026 VISION SYSTEM - "TOP BAR SAMPLING"
- * Update:
- * - Mengambil sampel warna di BAGIAN ATAS kotak (Top Bar) untuk menghindari air di tengah gate.
- * - Output koordinat dipusatkan (0 di tengah).
+ * SAUVC 2026 VISION SYSTEM - "ROBUST COLOR" EDITION
+ * Logika:
+ * - YOLO: Mendeteksi keberadaan objek (Gate/Flare/Drum).
+ * - OpenCV: Mengambil sampel area tengah (Center Crop) untuk analisis warna dominan.
+ * - Logika warna disesuaikan untuk air keruh (Foggy Water).
  */
 
 #include <rclcpp/rclcpp.hpp>
@@ -32,7 +33,7 @@ public:
         float conf = this->get_parameter("conf_thresh").as_double();
 
         if(model_path.empty()) {
-            RCLCPP_FATAL(this->get_logger(), "Model Path Empty!");
+            RCLCPP_FATAL(this->get_logger(), "Model Path Empty! Use: --ros-args -p model_path:=/path/to/model");
             exit(1);
         }
 
@@ -45,7 +46,7 @@ public:
             this->get_parameter("image_topic").as_string(), 10, 
             std::bind(&SauvcVisionNode::process_frame, this, _1));
 
-        RCLCPP_INFO(this->get_logger(), "Vision Node READY. Logic: Top Bar Sampling.");
+        RCLCPP_INFO(this->get_logger(), "Vision Node READY. Logic: YOLO + Center Color Sampling.");
     }
 
 private:
@@ -61,60 +62,56 @@ private:
         for (auto& det : yolo_results) {
             if(det.box.area() < MIN_AREA) continue; 
 
-            // 1. Cek Warna (PENTING: Gunakan Top Bar Sampling)
-            std::string color = get_color_robust(frame, det.box);
+            // 1. Ambil Warna Dominan (Metode Center Sampling)
+            std::string color = get_color_simple(frame, det.box);
             
-            bool is_gate = (det.label == "Gate" || det.label == "gate");
-            bool is_flare = (det.label == "Flare" || det.label == "flare");
-
-            // --- LOGIKA ID ---
-            if (is_gate) {
-                // Cek Flare nyasar
-                float aspect_ratio = (float)det.box.height / (float)det.box.width;
-                if ((color == "ORANGE" || color == "YELLOW") && aspect_ratio > 1.5) {
-                    is_gate = false;
-                    is_flare = true;
-                    RCLCPP_WARN_ONCE(this->get_logger(), "Gate corrected to Flare");
-                } 
-            }
-
-            std::string unique_id = "";
+            // 2. Tentukan Tipe Objek berdasarkan YOLO Label + Warna
             std::string final_label = "UNKNOWN";
             std::string type = "UNKNOWN";
+            std::string unique_id = "";
 
-            if (is_gate) {
-                unique_id = "GATE";
-                final_label = "GATE";
-                type = "GATE"; 
-            }
-            else if (is_flare) {
-                if (color == "ORANGE" || color == "YELLOW") {
-                    unique_id = "FLARE_OBSTACLE";
+            // LOGIKA GATE
+            if (det.label == "Gate" || det.label == "gate") {
+                // Gate biasanya merah/hitam. Tapi di air keruh, kita percaya YOLO dulu.
+                // Kecuali jika warnanya SANGAT Orange/Kuning dan bentuknya tiang, mungkin itu Flare.
+                float aspect_ratio = (float)det.box.height / (float)det.box.width;
+                
+                if ((color == "ORANGE" || color == "YELLOW") && aspect_ratio > 2.0) {
                     final_label = "FLARE";
-                    type = "OBSTACLE";
-                } else {
-                    unique_id = "FLARE_" + color; 
-                    final_label = "FLARE";
+                    unique_id = "FLARE_CORRECTED";
                     type = "TARGET";
+                } else {
+                    final_label = "GATE";
+                    unique_id = "GATE";
+                    type = "GATE";
                 }
             }
-            else if (det.label == "Drum" || det.label == "drum" || det.label == "Baskom") {
-                unique_id = "DRUM_" + color;
-                final_label = "DRUM";
-                type = (color == "BLUE") ? "TARGET_MAIN" : "TARGET_SEC";
+            // LOGIKA FLARE
+            else if (det.label == "Flare" || det.label == "flare") {
+                final_label = "FLARE";
+                unique_id = "FLARE";
+                type = "TARGET"; // Di rulebook SAUVC flare adalah target untuk ditabrak/dijatuhkan
+            }
+            // LOGIKA DRUM / LAINNYA
+            else {
+                final_label = det.label;
+                unique_id = det.label;
+                type = "UNKNOWN";
             }
 
             if (unique_id.empty()) continue;
 
-            // --- STABILITY & SMOOTHING ---
+            // --- STABILITY & SMOOTHING (Sama seperti sebelumnya) ---
             current_frame_hits[unique_id] = true;
             stability_counters_[unique_id]++; 
 
             if (stability_counters_[unique_id] < STABILITY_THRESH) {
+                // Gambar kotak abu-abu jika belum stabil
                 cv::rectangle(frame, det.box, cv::Scalar(128,128,128), 1);
                 continue; 
             }
 
+            // Hitung Pusat Massa
             int raw_cx = det.box.x + det.box.width / 2;
             int raw_cy = det.box.y + det.box.height / 2;
             
@@ -122,11 +119,12 @@ private:
                 smooth_history_[unique_id] = { (float)raw_cx, (float)raw_cy };
             }
 
+            // Low Pass Filter
             float smooth_x = SMOOTH_ALPHA * raw_cx + (1.0f - SMOOTH_ALPHA) * smooth_history_[unique_id].x;
             float smooth_y = SMOOTH_ALPHA * raw_cy + (1.0f - SMOOTH_ALPHA) * smooth_history_[unique_id].y;
             smooth_history_[unique_id] = { smooth_x, smooth_y };
 
-            // KOORDINAT TENGAH (0,0 di pusat layar)
+            // Koordinat Pusat (0,0 di tengah layar)
             int center_x = (int)smooth_x - (frame.cols / 2);
             int center_y = (int)smooth_y - (frame.rows / 2);
 
@@ -144,17 +142,18 @@ private:
             msg_array.detections.push_back(obj);
 
             // DRAW DEBUG
-            cv::Scalar draw_c = (type == "OBSTACLE") ? cv::Scalar(0,165,255) : 
-                                (type == "GATE") ? cv::Scalar(0,255,0) : cv::Scalar(255,0,0);
-            
+            cv::Scalar draw_c = cv::Scalar(0, 255, 0); // Default Hijau
+            if (final_label == "FLARE") draw_c = cv::Scalar(0, 165, 255); // Orange
+            if (final_label == "GATE") draw_c = cv::Scalar(0, 0, 255); // Merah
+
             cv::rectangle(frame, det.box, draw_c, 2);
-            cv::circle(frame, cv::Point((int)smooth_x, (int)smooth_y), 5, cv::Scalar(0,0,255), -1); 
+            cv::circle(frame, cv::Point((int)smooth_x, (int)smooth_y), 5, cv::Scalar(255,0,255), -1); 
             
-            std::string info = unique_id + " (" + color + ")";
+            std::string info = final_label + " [" + color + "]";
             cv::putText(frame, info, cv::Point(det.box.x, det.box.y-10), 0, 0.6, draw_c, 2);
         }
 
-        // Cleanup
+        // Cleanup Counters
         for (auto it = stability_counters_.begin(); it != stability_counters_.end(); ) {
             if (!current_frame_hits[it->first]) {
                 it->second -= 1; 
@@ -176,38 +175,50 @@ private:
         pub_debug_->publish(*debug_msg);
     }
 
-    // --- LOGIKA WARNA BARU: Top Bar Sampling ---
-    std::string get_color_robust(const cv::Mat& frame, cv::Rect box) {
+    // --- LOGIKA WARNA SIMPEL (Center Sampling) ---
+    std::string get_color_simple(const cv::Mat& frame, cv::Rect box) {
+        // Pastikan ROI aman
         cv::Rect roi = box & cv::Rect(0,0, frame.cols, frame.rows);
         
-        // Ambil 25% BAGIAN ATAS (Top Bar)
-        // Ambil 60% Lebar (Agar aman dari background pinggir)
-        int h_crop = roi.height * 0.25; 
-        int w_crop = roi.width * 0.6;   
-        
-        int x_crop = roi.x + (roi.width - w_crop) / 2; // Center Horizontal
-        int y_crop = roi.y; // Mulai dari ATAS box (y)
-        
+        // Ambil bagian tengah (50% dari lebar/tinggi box)
+        int w_crop = roi.width * 0.5;
+        int h_crop = roi.height * 0.5;
+        int x_crop = roi.x + (roi.width - w_crop) / 2;
+        int y_crop = roi.y + (roi.height - h_crop) / 2;
+
         if (w_crop <= 0 || h_crop <= 0) return "UNKNOWN";
-        
+
         cv::Mat crop = frame(cv::Rect(x_crop, y_crop, w_crop, h_crop));
-        cv::Mat hsv; cv::cvtColor(crop, hsv, cv::COLOR_BGR2HSV);
+        
+        // Convert ke HSV
+        cv::Mat hsv; 
+        cv::cvtColor(crop, hsv, cv::COLOR_BGR2HSV);
+        
+        // Hitung rata-rata warna
         cv::Scalar avg = cv::mean(hsv);
-        
-        double H = avg[0]; double S = avg[1]; double V = avg[2];
+        double H = avg[0]; 
+        double S = avg[1]; 
+        double V = avg[2];
 
-        // 1. Cek Hitam/Gelap (Bar Atas)
-        if (V < 70) return "BLACK"; 
+        // LOGIKA WARNA UNTUK AIR KERUH
+        // Warna air keruh biasanya Saturation rendah atau Value rendah (gelap).
         
-        // 2. Cek Noise Putih
-        if (S < 40) return "UNKNOWN"; 
+        // 1. Deteksi Merah (Gate/Flare)
+        // Rentang merah ada dua di OpenCV (0-10 dan 160-180)
+        if ((H < 15 || H > 160) && S > 50) return "RED";
 
-        // 3. Warna Lain
-        if (H < 10 || H > 160) return "RED";      
-        if (H >= 10 && H < 25) return "ORANGE";   
-        if (H >= 25 && H < 45) return "YELLOW";
-        if (H >= 45 && H < 85) return "GREEN";    
-        if (H >= 90 && H < 140) return "BLUE";    
+        // 2. Deteksi Oranye/Kuning (Flare)
+        if (H >= 15 && H < 40 && S > 50) return "ORANGE"; // Digabung jadi Orange/Yellow
+
+        // 3. Deteksi Hijau (Mungkin tiang gate hijau atau lumut)
+        // Hati-hati, air keruh kadang terbaca hijau muda. Naikkan threshold Saturation.
+        if (H >= 40 && H < 90 && S > 60) return "GREEN";
+
+        // 4. Deteksi Biru (Drum target)
+        if (H >= 90 && H < 130 && S > 50) return "BLUE";
+
+        // 5. Hitam (Gate bar atas sering tampak hitam siluet)
+        if (V < 60) return "BLACK";
 
         return "UNKNOWN";
     }
